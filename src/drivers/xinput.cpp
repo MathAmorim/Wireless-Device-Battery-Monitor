@@ -8,6 +8,7 @@
 #include <roapi.h>
 #include <winstring.h>
 #include <xinput.h>
+#define boolean bool
 #include <windows.system.power.h>
 // MinGW's windows.devices.power.h names BatteryStatus without its namespace; make it visible there.
 namespace ABI { namespace Windows { namespace Devices { namespace Power {
@@ -15,6 +16,7 @@ using ABI::Windows::System::Power::BatteryStatus;
 } } } }
 #include <windows.devices.power.h>
 #include <windows.gaming.input.h>
+#undef boolean
 
 namespace {
 

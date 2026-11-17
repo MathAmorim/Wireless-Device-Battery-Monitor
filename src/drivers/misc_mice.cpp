@@ -66,29 +66,99 @@ void PollMotospeed(PollContext& ctx) {
     }
 }
 
-// Xenta receiver (1D57:FA60, also FA65; cable FA55 / 2155), used by Delux and Attack Shark mice.
+// Xenta receiver (1D57:FA60, FA65; cable FA73 / FA55 / 2155 / FA61 / FA71..FA7D), used by Delux and Attack Shark mice.
 // The receiver broadcasts [03][model][40][state][level] every ~2 s; nothing is sent to it. The handle
-// stays open between polls so these frames queue up. A reading counts once two frames agree, because
-// every link-up starts with a false 100% (github.com/qu1ncky/BatteryTray, XentaReceiverProvider).
+// stays open between polls so these frames queue up.
 struct XentaModel { BYTE code; const wchar_t* name; bool tens; };
 const XentaModel kXentaModels[] = {
+    { 0x34, L"Delux M900 Pro 8K", false },
     { 0x3D, L"Delux M900 Pro", false },
+    { 0x37, L"Delux M900", false },
+    { 0x21, L"Delux M600", false },
+    { 0x30, L"Delux M600 Pro", false },
+    { 0x32, L"Delux M600 Pro 8K", false },
+    { 0x38, L"Delux M800 Pro 3395", false },
+    { 0x39, L"Delux M800 Pro 3311", false },
+    { 0x3A, L"Delux M800 Pro+", false },
+    { 0x3F, L"Delux M600 3325", false },
+    { 0x29, L"Delux M500 Pro", false },
+    { 0x50, L"Delux M300 Pro", false },
+    { 0x56, L"Delux M700 Pro", false },
     { 0x55, L"Attack Shark X11", false },
     { 0x4E, L"Attack Shark X3 Max", false },
     { 0xE5, L"Attack Shark V3 Pro", false },
     { 0x10, L"Attack Shark X6 / R1", true },  // level reported in tens (0-10)
 };
 
+bool IsXentaCablePid(USHORT pid) {
+    switch (pid) {
+        case 0xFA73: case 0xFA55: case 0x2155: case 0xFA61:
+        case 0xFA71: case 0xFA72: case 0xFA74: case 0xFA75:
+        case 0xFA76: case 0xFA77: case 0xFA78: case 0xFA79:
+        case 0xFA7A: case 0xFA7B: case 0xFA7C: case 0xFA7D:
+            return true;
+        default:
+            return false;
+    }
+}
+
+const wchar_t* DefaultXentaNameByPid(USHORT pid) {
+    switch (pid) {
+        case 0xFA65: case 0xFA73: return L"Delux M900 Pro 8K";
+        case 0xFA72: return L"Delux M600 Pro 8K";
+        case 0xFA74: return L"Delux M900";
+        case 0xFA75: return L"Delux M800 Pro 3395";
+        case 0xFA76: return L"Delux M800 Pro 3311";
+        case 0xFA77: return L"Delux M800 Pro+";
+        case 0xFA78: return L"Delux M800 Pro 3370";
+        default: return L"Delux M900 Pro";
+    }
+}
+
 struct XentaListener {
     std::unique_ptr<HidDev> dev;
     std::vector<BYTE> last, prev;  // the two most recent battery frames
     ULONGLONG lastFrameAt = 0;
+    ULONGLONG prevFrameAt = 0;
 };
 std::map<std::wstring, XentaListener> g_xenta;  // by collection path
+std::wstring g_lastXentaName;
+int g_lastXentaPct = -1;
 
 void PollXenta(PollContext& ctx) {
-    const USHORT pids[] = { 0xFA60, 0xFA65, 0xFA55, 0x2155 };
+    const USHORT pids[] = {
+        0xFA73, 0xFA55, 0x2155, 0xFA61, 0xFA71, 0xFA72, 0xFA74, 0xFA75,
+        0xFA76, 0xFA77, 0xFA78, 0xFA79, 0xFA7A, 0xFA7B, 0xFA7C, 0xFA7D,
+        0xFA65, 0xFA60
+    };
     std::set<std::wstring> present;
+    bool cablePresent = false;
+    USHORT cablePid = 0;
+    bool receiverPresent = false;
+    USHORT receiverPid = 0;
+
+    for (USHORT pid : pids) {
+        if (ctx.IsClaimed(0x1D57, pid)) continue;
+        auto allForPid = ctx.Find(0x1D57, pid, [](const HidColl&) { return true; });
+        if (allForPid.empty()) continue;
+        if (IsXentaCablePid(pid)) {
+            cablePresent = true;
+            if (!cablePid) cablePid = pid;
+        } else {
+            receiverPresent = true;
+            if (!receiverPid) receiverPid = pid;
+        }
+    }
+
+    if (!cablePresent && !receiverPresent) {
+        g_xenta.clear();
+        return;
+    }
+
+    // Read any queued frames from all present 000A collections (both cable and receiver).
+    const XentaListener* bestListener = nullptr;
+    USHORT activePid = cablePresent ? cablePid : receiverPid;
+
     for (USHORT pid : pids) {
         if (ctx.IsClaimed(0x1D57, pid)) continue;
         for (const HidColl* c : ctx.Find(0x1D57, pid, [](const HidColl& c) { return c.page() == 0x000A && c.inLen() >= 5; })) {
@@ -99,49 +169,110 @@ void PollXenta(PollContext& ctx) {
                 l.dev = std::make_unique<HidDev>();
                 if (!l.dev->Open(*c)) { g_xenta.erase(c->path); continue; }
             }
-            // Take everything queued since the last poll; a new listener waits for two frames.
-            ULONGLONG until = GetTickCount64() + (fresh ? 5000 : 0);
+            // Drain everything queued since the last poll; on first open wait up to 500ms so we don't freeze if asleep.
+            ULONGLONG until = GetTickCount64() + (fresh ? 500 : 0);
             std::vector<BYTE> r;
             int got = 0;
             while (true) {
-                int wait = fresh && got < 2 ? (int)std::max<LONGLONG>(1, (LONGLONG)until - (LONGLONG)GetTickCount64()) : 30;
-                if (fresh && got < 2 && (LONGLONG)until - (LONGLONG)GetTickCount64() <= 0) break;
+                int wait = (fresh && got == 0) ? (int)std::max<LONGLONG>(1, (LONGLONG)until - (LONGLONG)GetTickCount64()) : 25;
+                if (fresh && got == 0 && (LONGLONG)until - (LONGLONG)GetTickCount64() <= 0) break;
                 if (l.dev->Read(r, wait) < 5) break;
                 if (r[0] != 0x03 || r[2] != 0x40) continue;
                 l.prev = l.last;
+                l.prevFrameAt = l.lastFrameAt;
                 l.last.assign(r.begin(), r.begin() + 5);
                 l.lastFrameAt = GetTickCount64();
                 got++;
             }
-            if (l.last.empty() || GetTickCount64() - l.lastFrameAt > 15000) break;  // mouse off: no frames
-            bool cable = pid == 0xFA55 || pid == 0x2155;
-            BYTE code = l.last[1], st = l.last[3], level = l.last[4];
-            const XentaModel* model = nullptr;
-            for (const auto& m : kXentaModels)
-                if (m.code == code) model = &m;
-            DeviceStatus s;
-            s.key = L"xenta:" + Hex4(pid);
-            s.name = model ? model->name : L"Wireless mouse";
-            s.kind = DeviceKind::Mouse;
-            s.via = cable ? L"USB cable" : L"2.4 GHz receiver";
-            bool agreed = l.prev == l.last;
-            if (cable || st == 0x02 || st == 0x03) {
-                s.charging = true;  // the level is frozen on external power
-                if (st == 0x02 && !cable) s.percent = 100;
-            } else if (agreed) {
-                if (model && model->tens) {
-                    if (level >= 1 && level <= 10) s.percent = level * 10;
-                } else if (st == 0x01 && level >= 1 && level <= 100) {
-                    s.percent = level;
+            if (!l.last.empty()) {
+                if (!bestListener || l.lastFrameAt > bestListener->lastFrameAt) {
+                    bestListener = &l;
                 }
             }
-            if (s.percent < 0 && !s.charging) s.asleep = true;  // shown with the last known value
-            ctx.Add(s, 0x1D57, pid);
-            break;
         }
     }
+
     for (auto it = g_xenta.begin(); it != g_xenta.end();)  // forget receivers that were unplugged
         it = present.count(it->first) ? std::next(it) : g_xenta.erase(it);
+
+    DeviceStatus s;
+    s.key = L"xenta:delux_mouse";
+    s.kind = DeviceKind::Mouse;
+    s.graceSec = 86400;  // keep showing last known percentage while sleeping
+
+    ULONGLONG now = GetTickCount64();
+    bool hasRecentFrame = bestListener && !bestListener->last.empty() && (now - bestListener->lastFrameAt <= 15000);
+
+    const XentaModel* model = nullptr;
+    if (bestListener && !bestListener->last.empty()) {
+        BYTE code = bestListener->last[1];
+        for (const auto& m : kXentaModels)
+            if (m.code == code) model = &m;
+    }
+    if (model) g_lastXentaName = model->name;
+    s.name = !g_lastXentaName.empty() ? g_lastXentaName : DefaultXentaNameByPid(activePid);
+
+    if (cablePresent) {
+        s.via = L"Cabo USB";
+        s.charging = true;
+        if (hasRecentFrame) {
+            BYTE st = bestListener->last[3];
+            BYTE level = bestListener->last[4];
+            int scaled = (model && model->tens) ? level * 10 : level;
+            if (st == 0x02) {
+                s.percent = 100;
+                g_lastXentaPct = 100;
+            } else if (scaled >= 1 && scaled <= 100) {
+                s.percent = scaled;
+                g_lastXentaPct = scaled;
+            }
+        }
+        if (s.percent < 0 && g_lastXentaPct >= 0) s.percent = g_lastXentaPct;
+    } else {
+        s.via = (receiverPid == 0xFA65) ? L"Receptor 2.4 GHz (8K)" : L"Receptor 2.4 GHz";
+        if (hasRecentFrame) {
+            BYTE st = bestListener->last[3];
+            BYTE level = bestListener->last[4];
+            int scaled = (model && model->tens) ? level * 10 : level;
+            if (st == 0x02) {
+                s.charging = true;
+                s.percent = 100;
+                g_lastXentaPct = 100;
+            } else if (st == 0x03) {
+                s.charging = true;
+                if (scaled >= 1 && scaled <= 100) {
+                    s.percent = scaled;
+                    g_lastXentaPct = scaled;
+                } else if (g_lastXentaPct >= 0) {
+                    s.percent = g_lastXentaPct;
+                }
+            } else if (st == 0x01 && scaled >= 1 && scaled <= 100) {
+                s.charging = false;
+                // Only filter a sudden 100% on the very first frame after wake/reconnect if previous wasn't 100%.
+                bool wakeSpike100 = (scaled == 100 && g_lastXentaPct >= 0 && g_lastXentaPct < 98 &&
+                                     (bestListener->prev.empty() || bestListener->prev[4] != level));
+                if (!wakeSpike100) {
+                    s.percent = scaled;
+                    g_lastXentaPct = scaled;
+                } else {
+                    s.percent = g_lastXentaPct;
+                }
+            }
+        } else {
+            // Mouse is sleeping on the desk (receiver does not wake it up; we just keep the last reading visible).
+            s.asleep = true;
+            s.charging = false;
+            s.percent = -1;
+        }
+    }
+
+    for (USHORT pid : pids) {
+        if (!ctx.IsClaimed(0x1D57, pid)) {
+            auto allForPid = ctx.Find(0x1D57, pid, [](const HidColl&) { return true; });
+            if (!allForPid.empty()) ctx.Claim(0x1D57, pid);
+        }
+    }
+    ctx.out.push_back(s);
 }
 
 void PollAjazz(PollContext& ctx) {

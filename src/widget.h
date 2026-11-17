@@ -11,9 +11,12 @@ struct WidgetItem {
     int  percent  = -1;     // -1 = unknown
     std::wstring text;      // shown instead of the percentage when set (coarse levels like "Low")
     bool charging = false;
+    bool wired    = false;  // connected via USB cable -> shows [Mouse] [Plug]
+    bool hidePctOnCable = false;
+    bool colorByLevel = true;
     bool dim      = false;  // asleep / stale value
     bool low      = false;
-    bool bluetooth = false;  // picks the Bluetooth icon when the device type is unknown
+    bool bluetooth = false; // picks the Bluetooth icon when the device type is unknown
 };
 
 namespace widget {

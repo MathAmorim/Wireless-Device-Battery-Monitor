@@ -32,6 +32,7 @@ wchar_t Glyph(DeviceKind k, bool bluetooth) {
     }
 }
 constexpr wchar_t kBolt = 0xE945;            // LightningBolt
+constexpr wchar_t kPlug = 0xE83E;            // Power Plug / Cable (🔌)
 constexpr wchar_t kBatteryUnknown = 0xE996;  // shown when there is nothing to display
 
 // Creates a font, falling back when the preferred face is not installed (GDI would silently substitute).
@@ -95,6 +96,16 @@ Mask RenderMask(const std::wstring& s, HFONT font) {
 
 struct Rgb { int r, g, b; };
 
+Rgb LerpRgb(Rgb a, Rgb b, int num, int den) {
+    if (den <= 0) return a;
+    num = std::clamp(num, 0, den);
+    return {
+        a.r + (b.r - a.r) * num / den,
+        a.g + (b.g - a.g) * num / den,
+        a.b + (b.b - a.b) * num / den,
+    };
+}
+
 struct Canvas {
     int w, h;
     std::vector<DWORD> px;  // premultiplied BGRA
@@ -110,35 +121,98 @@ struct Canvas {
         int ob = c.b * a / 255 + db * inv / 255;
         px[y * w + x] = ((DWORD)oa << 24) | ((DWORD)orr << 16) | ((DWORD)og << 8) | (DWORD)ob;
     }
-    void Draw(const Mask& m, int x, int y, Rgb c, int alpha) {
-        for (int j = 0; j < m.h; j++)
-            for (int i = 0; i < m.w; i++) Blend(x + i, y + j, c, m.a[j * m.w + i] * alpha / 255);
+    void Draw(const Mask& m, int x, int y, Rgb cTop, Rgb cBot, int alpha) {
+        int den = std::max(1, m.h - 1);
+        for (int j = 0; j < m.h; j++) {
+            Rgb rowColor = LerpRgb(cTop, cBot, j, den);
+            for (int i = 0; i < m.w; i++) {
+                Blend(x + i, y + j, rowColor, m.a[j * m.w + i] * alpha / 255);
+            }
+        }
     }
 };
 
-struct Piece { Mask m; Rgb color; int alpha; int gapAfter; };
+struct Piece {
+    Mask m;
+    Rgb colorTop;
+    Rgb colorBot;
+    int alpha;
+    int gapAfter;
+};
+
+void ComputeLevelColors(const WidgetItem& it, Rgb& outTop, Rgb& outBot) {
+    Rgb fg = g_light ? Rgb{ 0, 0, 0 } : Rgb{ 255, 255, 255 };
+    Rgb charge = g_light ? Rgb{ 0, 120, 212 } : Rgb{ 96, 205, 255 };     // #60CDFF / #0078D4
+    Rgb red = g_light ? Rgb{ 196, 30, 40 } : Rgb{ 255, 90, 90 };          // #FF5A5A (0..20%)
+    Rgb green = g_light ? Rgb{ 24, 155, 80 } : Rgb{ 46, 204, 113 };       // #2ECC71 (51..100%)
+
+    if (!it.colorByLevel) {
+        Rgb c = it.low ? red : fg;
+        outTop = outBot = c;
+        return;
+    }
+    if (it.charging) {
+        outTop = outBot = charge;
+        return;
+    }
+    if (it.percent < 0) {
+        outTop = outBot = fg;
+        return;
+    }
+    if (it.percent <= 20) {
+        outTop = outBot = red;
+        return;
+    }
+    if (it.percent >= 51) {
+        outTop = outBot = green;
+        return;
+    }
+    // 21% to 50%: Smooth gradient from Yellow (#FFE000) to Orange (#FF6B00), centered on #FFA500.
+    // Both interpolated by level (50% -> 21%) and rendered with a vertical Yellow -> Orange gradient.
+    Rgb yellowTop = g_light ? Rgb{ 215, 155, 0 } : Rgb{ 255, 228, 0 };    // bright yellow
+    Rgb orangeMid = g_light ? Rgb{ 205, 115, 0 } : Rgb{ 255, 165, 0 };    // #FFA500
+    Rgb orangeBot = g_light ? Rgb{ 190, 75, 0 }  : Rgb{ 255, 102, 0 };    // deep orange
+    int num = 50 - std::clamp(it.percent, 21, 50);                        // 0 at 50%, 29 at 21%
+    outTop = LerpRgb(yellowTop, orangeMid, num, 29);
+    outBot = LerpRgb(orangeMid, orangeBot, num, 29);
+}
 
 std::vector<Piece> Layout(int& width) {
     Rgb fg = g_light ? Rgb{ 0, 0, 0 } : Rgb{ 255, 255, 255 };
-    Rgb red = g_light ? Rgb{ 196, 30, 40 } : Rgb{ 255, 90, 90 };
     Rgb charge = g_light ? Rgb{ 0, 120, 212 } : Rgb{ 96, 205, 255 };
     HFONT icons = MakeFont(Px(16), FW_NORMAL, L"Segoe Fluent Icons", L"Segoe MDL2 Assets");
+    HFONT plugFont = MakeFont(Px(14), FW_NORMAL, L"Segoe Fluent Icons", L"Segoe MDL2 Assets");
     HFONT bolt = MakeFont(Px(11), FW_NORMAL, L"Segoe Fluent Icons", L"Segoe MDL2 Assets");
-    HFONT text = MakeFont(Px(13), FW_NORMAL, L"Segoe UI Variable Text", L"Segoe UI");
+    HFONT text = MakeFont(Px(13), FW_SEMIBOLD, L"Segoe UI Variable Text", L"Segoe UI");
 
     std::vector<Piece> out;
-    if (g_items.empty()) out.push_back({ RenderMask(std::wstring(1, kBatteryUnknown), icons), fg, 110, 0 });
+    if (g_items.empty()) out.push_back({ RenderMask(std::wstring(1, kBatteryUnknown), icons), fg, fg, 110, 0 });
     for (size_t i = 0; i < g_items.size(); i++) {
         const auto& it = g_items[i];
-        int a = it.dim ? 120 : 255;
-        Rgb tc = it.low ? red : fg;
-        out.push_back({ RenderMask(std::wstring(1, Glyph(it.kind, it.bluetooth)), icons), fg, a, Px(5) });
-        std::wstring t = !it.text.empty() ? it.text : it.percent >= 0 ? std::to_wstring(it.percent) + L"%" : L"?";
-        out.push_back({ RenderMask(t, text), tc, a, it.charging ? Px(2) : 0 });
-        if (it.charging) out.push_back({ RenderMask(std::wstring(1, kBolt), bolt), charge, a, 0 });
+        int a = (it.dim && !it.charging) ? 140 : 255;
+        Rgb tcTop, tcBot;
+        ComputeLevelColors(it, tcTop, tcBot);
+
+        bool showText = !(it.wired && it.hidePctOnCable);
+        int gapAfterMouse = it.wired ? Px(3) : (showText ? Px(5) : 0);
+        out.push_back({ RenderMask(std::wstring(1, Glyph(it.kind, it.bluetooth)), icons), fg, fg, a, gapAfterMouse });
+
+        if (it.wired) {
+            // [Ícone Mouse] [🔌]
+            out.push_back({ RenderMask(std::wstring(1, kPlug), plugFont), charge, charge, 255, showText ? Px(5) : 0 });
+        }
+
+        if (showText) {
+            std::wstring t = !it.text.empty() ? it.text : it.percent >= 0 ? std::to_wstring(it.percent) + L"%" : L"?";
+            bool showBolt = it.charging && !it.wired;
+            out.push_back({ RenderMask(t, text), tcTop, tcBot, a, showBolt ? Px(2) : 0 });
+            if (showBolt) out.push_back({ RenderMask(std::wstring(1, kBolt), bolt), charge, charge, a, 0 });
+        }
+
         out.back().gapAfter = i + 1 < g_items.size() ? Px(14) : 0;
     }
     DeleteObject(icons);
+    DeleteObject(plugFont);
     DeleteObject(bolt);
     DeleteObject(text);
 
@@ -174,7 +248,7 @@ void Paint() {
 
     int x = Px(8);
     for (auto& p : pieces) {
-        cv.Draw(p.m, x, (H - p.m.h) / 2, p.color, p.alpha);
+        cv.Draw(p.m, x, (H - p.m.h) / 2, p.colorTop, p.colorBot, p.alpha);
         x += p.m.w + p.gapAfter;
     }
 
@@ -266,7 +340,7 @@ bool Create(HINSTANCE inst, HWND notifyWnd, UINT clickMsg, bool lightTheme) {
         ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
         ti.hwnd = notifyWnd;
         ti.uId = (UINT_PTR)g_wnd;
-        ti.lpszText = const_cast<wchar_t*>(L"Wireless Battery");
+        ti.lpszText = const_cast<wchar_t*>(L"Monitor de Bateria Sem Fio");
         SendMessageW(g_tip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
         SendMessageW(g_tip, TTM_SETMAXTIPWIDTH, 0, 600);
     }
